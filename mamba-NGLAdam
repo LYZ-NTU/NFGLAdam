@@ -1,0 +1,296 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.preprocessing import scale
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from mamba import Mamba, MambaConfig
+import os
+import argparse
+from math import gamma
+from torch.optim import Optimizer
+from datetime import datetime
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--use-cuda', default=False,
+                    help='CUDA training.')
+parser.add_argument('--seed', type=int, default=1, help='Random seed.')
+parser.add_argument('--epochs', type=int, default=100,
+                    help='Number of epochs to train.')
+parser.add_argument('--lr', type=float, default=0.01,
+                    help='Learning rate.')
+parser.add_argument('--wd', type=float, default=1e-5,
+                    help='Weight decay (L2 loss on parameters).')
+parser.add_argument('--hidden', type=int, default=16,
+                    help='Dimension of representations')
+parser.add_argument('--layer', type=int, default=2,
+                    help='Num of layers')
+parser.add_argument('--task', type=str, default='RUL',
+                    help='RUL or SOH')
+parser.add_argument('--case', type=str, default='B',
+                    help='A or B')
+parser.add_argument('--ordered', type=float, default=0.1,
+                    help='Fractional order for GL derivative')
+parser.add_argument('--h', type=float, default=0.1,
+                    help='Step size for GL fractional gradient')
+
+args = parser.parse_args()
+args.cuda = args.use_cuda and torch.cuda.is_available()
+
+
+def evaluation_metric(y_test, y_hat):
+    MSE = mean_squared_error(y_test, y_hat)
+    RMSE = MSE ** 0.5
+    MAE = mean_absolute_error(y_test, y_hat)
+    R2 = r2_score(y_test, y_hat)
+    print('%.4f %.4f %.4f %.4f' % (MSE, RMSE, MAE, R2))
+    return MSE, RMSE, MAE, R2
+
+
+def set_seed(seed, cuda):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if cuda:
+        torch.cuda.manual_seed(seed)
+
+
+set_seed(args.seed, args.cuda)
+
+
+# ===================== NFGLAdam 优化器（PyTorch适配版）=====================
+class GLFractionalAdam(Optimizer):
+    def __init__(self, params, lr=0.01, betas=(0.9, 0.999), eps=1e-8,
+                 ordered=0.5, h=0.1, weight_decay=0):
+ 
+        defaults = dict(lr=lr, betas=betas, eps=eps,
+                        ordered=ordered, h=h, weight_decay=weight_decay)
+        super(GLFractionalAdam, self).__init__(params, defaults)
+
+    def _gl_fractional_gradient(self, grad, ordered, h):
+
+        n = int(1 / h) if h > 0 else 1
+        grad_frac = grad.clone()
+
+        if ordered != 1.0:
+            grad_frac = grad_frac * (h ** (-ordered))
+
+        return grad_frac
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            lr = group['lr']
+            beta1, beta2 = group['betas']
+            eps = group['eps']
+            ordered = group['ordered']
+            h = group['h']
+            weight_decay = group['weight_decay']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.data
+
+                if weight_decay != 0:
+                    grad = grad.add(p.data, alpha=weight_decay)
+
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                state['step'] += 1
+
+                grad_frac = self._gl_fractional_gradient(grad, ordered, h)
+
+                exp_avg.mul_(beta1).add_(grad_frac, alpha=1 - beta1)
+
+                exp_avg_sq.mul_(beta2).addcmul_(grad_frac, grad_frac, value=1 - beta2)
+
+                bias_correction1 = 1 - beta1 ** state['step']
+                bias_correction2 = 1 - beta2 ** state['step']
+
+                step_size = lr / bias_correction1
+
+                denom = (exp_avg_sq.sqrt() / (bias_correction2 ** 0.5)).add_(eps)
+
+                p.data.addcdiv_(exp_avg, denom, value=-step_size)
+
+        return loss
+
+
+class Net(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.config = MambaConfig(d_model=args.hidden, n_layers=args.layer)
+        self.mamba = nn.Sequential(
+            nn.Linear(in_dim, args.hidden),
+            Mamba(self.config),
+            nn.Linear(args.hidden, out_dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.mamba(x)
+        return x.flatten()
+
+
+def PredictWithData(trainX, trainy, testX, testy):
+
+    if not os.path.exists('results'):
+        os.makedirs('results')
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    csv_filename = f'results/training_metrics_{args.task}_{args.case}_{timestamp}.csv'
+
+    metrics_log = []
+
+    clf = Net(len(trainX[0]), 1)
+
+
+    opt = GLFractionalAdam(clf.parameters(),
+                           lr=args.lr,
+                           betas=(0.9, 0.999),
+                           eps=1e-8,
+                           ordered=args.ordered,
+                           h=args.h,
+                           weight_decay=args.wd)
+
+    xt = torch.from_numpy(trainX).float().unsqueeze(0)
+    xv = torch.from_numpy(testX).float().unsqueeze(0)
+    yt = torch.from_numpy(trainy).float()
+    yv = torch.from_numpy(testy).float()
+
+    tf = len(testy)
+
+    if args.cuda:
+        clf = clf.cuda()
+        xt = xt.cuda()
+        xv = xv.cuda()
+        yt = yt.cuda()
+        yv = yv.cuda()
+
+    for e in range(args.epochs):
+        clf.train()
+        z = clf(xt)
+        train_loss = F.l1_loss(z, yt)
+        opt.zero_grad()
+        train_loss.backward()
+        opt.step()
+
+        clf.eval()
+        with torch.no_grad():
+            z_test = clf(xv)
+            test_loss = F.l1_loss(z_test, yv)
+
+            if args.task == 'RUL':
+                y_true = yv.cpu().numpy() * tf if args.cuda else yv.numpy() * tf
+                y_pred = z_test.cpu().numpy() * tf if args.cuda else z_test.numpy() * tf
+            else:
+                y_true = yv.cpu().numpy() if args.cuda else yv.numpy()
+                y_pred = z_test.cpu().numpy() if args.cuda else z_test.numpy()
+
+            MSE, RMSE, MAE, R2 = evaluation_metric(y_true, y_pred)
+
+        log_entry = {
+            'epoch': e + 1,
+            'train_loss': train_loss.item(),
+            'test_loss': test_loss.item(),
+            'MSE': MSE,
+            'RMSE': RMSE,
+            'MAE': MAE,
+            'R2': R2
+        }
+        metrics_log.append(log_entry)
+
+        if e % 10 == 0 and e != 0:
+            print(f'Epoch {e} | Train Loss: {train_loss.item():.4f} | Test Loss: {test_loss.item():.4f}')
+
+    df_metrics = pd.DataFrame(metrics_log)
+    df_metrics.to_csv(csv_filename, index=False, encoding='utf-8')
+    print(f'\n训练指标已保存到: {csv_filename}')
+
+    clf.eval()
+    mat = clf(xv)
+    if args.cuda:
+        mat = mat.cpu()
+    yhat = mat.detach().numpy().flatten()
+
+    return yhat
+
+
+def ReadData(path, csv, task):
+    f = os.path.join(path, csv)
+    data = pd.read_csv(f)
+    tf = len(data)
+    y = data[task]
+    y = y.values
+    if args.task == 'RUL':
+        y = y / tf
+    x = data.drop(['RUL', 'SOH'], axis=1).values
+    x = scale(x)
+    return x, y
+
+path = './data/Case' + args.case
+if args.case == 'A':
+    xt1, yt1 = ReadData(path, '91.csv', args.task)
+    xt2, yt2 = ReadData(path, '100.csv', args.task)
+    trainX = np.vstack((xt1, xt2))
+    trainy = np.hstack((yt1, yt2))
+    testX, testy = ReadData(path, '124.csv', args.task)
+else:
+    xt1, yt1 = ReadData(path, '101.csv', args.task)
+    xt2, yt2 = ReadData(path, '108.csv', args.task)
+    xt3, yt3 = ReadData(path, '120.csv', args.task)
+    trainX = np.vstack((xt1, xt2, xt3))
+    trainy = np.hstack((yt1, yt2, yt3))
+    testX, testy = ReadData(path, '116.csv', args.task)
+
+testy_original = testy.copy()
+
+predictions = PredictWithData(trainX, trainy, testX, testy)
+
+tf = len(testy)
+if args.task == 'RUL':
+    testy = tf * testy
+    predictions = tf * predictions
+
+print('\n最终评估结果:')
+print('MSE RMSE MAE R2')
+final_metrics = evaluation_metric(testy, predictions)
+
+final_metrics_df = pd.DataFrame({
+    'task': [args.task],
+    'case': [args.case],
+    'final_MSE': [final_metrics[0]],
+    'final_RMSE': [final_metrics[1]],
+    'final_MAE': [final_metrics[2]],
+    'final_R2': [final_metrics[3]],
+    'epochs': [args.epochs],
+    'lr': [args.lr],
+    'ordered': [args.ordered],
+    'h': [args.h]
+})
+
+final_csv_filename = f'results/final_metrics_{args.task}_{args.case}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+final_metrics_df.to_csv(final_csv_filename, index=False, encoding='utf-8')
+print(f'最终评估指标已保存到: {final_csv_filename}')
+
+plt.figure()
+plt.plot(testy, label='True')
+plt.plot(predictions, label='Estimation')
+plt.title(args.task + ' Estimation')
+plt.xlabel('Cycle')
+plt.ylabel(args.task + ' value')
+plt.legend()
+plt.show()
